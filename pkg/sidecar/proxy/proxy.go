@@ -137,6 +137,19 @@ type Config struct {
 	// no effect with --kv-connector=offloading, where the tier is always present.
 	EnableP2PPull bool
 
+	// KVCRControlPort is the peer's KVCR ZMQ control port, emitted as the
+	// kv_hints source_control_endpoint. Note this is the control plane, not the
+	// HTTP port: KVCR transfers are destination-initiated, so the consumer asks
+	// over ZMQ and the producer RDMA-writes back. With data parallelism it is
+	// the rank-0 port, matching KVCR's control_ports[dp_local_rank].
+	// Meaningful with --kv-connector=kvcr or --enable-kvcr-pull.
+	KVCRControlPort int
+
+	// EnableKVCRPull declares that a KVCR secondary tier is available for
+	// cached-prefix pulls even when the PD connector is not kvcr. The KVCR
+	// sibling of EnableP2PPull, and mutually exclusive with it.
+	EnableKVCRPull bool
+
 	// EnableSSRFProtection enables SSRF protection using InferencePool allowlisting.
 	EnableSSRFProtection bool
 	// InferencePoolNamespace is the Kubernetes namespace of the InferencePool to watch.
@@ -519,6 +532,10 @@ func (s *Server) setKVConnector() {
 	case constants.KVConnectorOffloading:
 		s.handlePDConnector = func(w http.ResponseWriter, r *http.Request, host string, kvCacheSource string, apiType reqcommon.APIType) {
 			s.handleP2P(w, r, host, kvCacheSource, apiType)
+		}
+	case constants.KVConnectorKVCR:
+		s.handlePDConnector = func(w http.ResponseWriter, r *http.Request, host string, kvCacheSource string, apiType reqcommon.APIType) {
+			s.handleKVCR(w, r, host, kvCacheSource, apiType)
 		}
 	case constants.KVConnectorNIXLV2:
 		fallthrough

@@ -32,6 +32,12 @@ const (
 	// KVConnectorOffloading enables the OffloadingConnector P/D KV disaggregation protocol
 	KVConnectorOffloading = "offloading"
 
+	// KVConnectorKVCR enables the OffloadingConnector P/D KV disaggregation
+	// protocol driven by a KVCR secondary tier. The transport is the same
+	// OffloadingConnector; only the request field differs, a router kv_hints
+	// envelope naming the peer rather than kv_transfer_params.
+	KVConnectorKVCR = "kvcr"
+
 	// ECExampleConnector enables the Encoder disaggregation protocol (E/PD, E/P/D)
 	ECExampleConnector = "ec-example"
 

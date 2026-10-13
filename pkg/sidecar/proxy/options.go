@@ -63,6 +63,8 @@ const (
 	mooncakeBootstrapPortFlag = "mooncake-bootstrap-port"
 	p2pConnectorPortFlag      = "p2p-connector-port"
 	enableP2PPull             = "enable-p2p-pull"
+	kvcrControlPortFlag       = "kvcr-control-port"
+	enableKVCRPull            = "enable-kvcr-pull"
 	enableSSRFProtection      = "enable-ssrf-protection"
 	enablePrefillerSampling   = "enable-prefiller-sampling"
 	enableTLS                 = "enable-tls"
@@ -89,6 +91,7 @@ const (
 	envEnablePrefillerSampling = "ENABLE_PREFILLER_SAMPLING"
 	envMooncakeBootstrapPort   = "MOONCAKE_BOOTSTRAP_PORT"
 	envP2PConnectorPort        = "P2P_CONNECTOR_PORT"
+	envKVCRControlPort         = "KVCR_CONTROL_PORT"
 
 	// Defaults
 	defaultPort                  = "8000"
@@ -96,6 +99,7 @@ const (
 	defaultDataParallelSize      = 1
 	defaultMooncakeBootstrapPort = 8998
 	defaultP2PConnectorPort      = 7777
+	defaultKVCRControlPort       = 17771
 
 	// defaultMoRIIOParallelDecodeWaitTimeout backstops the parallel WRITE
 	// dispatch: it bounds how long the decode request waits on the prefill outcome
@@ -116,12 +120,14 @@ type yamlConfiguration struct {
 	ModelServerPort         int      `json:"model-server-port,omitempty"`
 	MooncakeBootstrapPort   int      `json:"mooncake-bootstrap-port,omitempty"`
 	P2PConnectorPort        int      `json:"p2p-connector-port,omitempty"`
+	KVCRControlPort         int      `json:"kvcr-control-port,omitempty"`
 	DataParallelSize        int      `json:"data-parallel-size,omitempty"`
 	KVConnector             string   `json:"kv-connector,omitempty"`
 	ECConnector             string   `json:"ec-connector,omitempty"`
 	EnableSSRFProtection    *bool    `json:"enable-ssrf-protection,omitempty"`
 	EnablePrefillerSampling *bool    `json:"enable-prefiller-sampling,omitempty"`
 	EnableP2PPull           *bool    `json:"enable-p2p-pull,omitempty"`
+	EnableKVCRPull          *bool    `json:"enable-kvcr-pull,omitempty"`
 	SecureServing           *bool    `json:"secure-serving,omitempty"`
 	SecureProxy             *bool    `json:"secure-proxy,omitempty"`
 	CertPath                string   `json:"cert-path,omitempty"`
@@ -174,6 +180,7 @@ var (
 		constants.KVConnectorSGLang:        {},
 		constants.KVConnectorMooncake:      {},
 		constants.KVConnectorOffloading:    {},
+		constants.KVConnectorKVCR:          {},
 	}
 
 	// supportedECConnectors defines all valid E/P EC connector types
@@ -189,7 +196,7 @@ var (
 		encodeStage:  {},
 	}
 
-	supportedKVConnectorNamesStr = strings.Join([]string{constants.KVConnectorNIXLV2, constants.KVConnectorSharedStorage, constants.KVConnectorSGLang, constants.KVConnectorMooncake, constants.KVConnectorOffloading}, ", ")
+	supportedKVConnectorNamesStr = strings.Join([]string{constants.KVConnectorNIXLV2, constants.KVConnectorSharedStorage, constants.KVConnectorSGLang, constants.KVConnectorMooncake, constants.KVConnectorOffloading, constants.KVConnectorKVCR}, ", ")
 	supportedECConnectorNamesStr = strings.Join([]string{constants.ECExampleConnector, constants.ECConnectorNIXL}, ", ")
 
 	supportedTLSStageNamesStr = strings.Join([]string{prefillStage, decodeStage, encodeStage}, ", ")
@@ -216,6 +223,13 @@ func NewOptions() *Options {
 		}
 	}
 
+	kvcrControlPort := defaultKVCRControlPort
+	if portStr := os.Getenv(envKVCRControlPort); portStr != "" {
+		if port, err := strconv.Atoi(portStr); err == nil {
+			kvcrControlPort = port
+		}
+	}
+
 	return &Options{
 		Config: Config{
 			Port:                    defaultPort,
@@ -228,6 +242,7 @@ func NewOptions() *Options {
 			PrefillRetryBackoff:     200 * time.Millisecond,
 			MooncakeBootstrapPort:   mooncakeBootstrapPort,
 			P2PConnectorPort:        p2pConnectorPort,
+			KVCRControlPort:         kvcrControlPort,
 			PoolGroup:               routing.InferencePoolAPIGroup,
 			DecodeChunkSize:         0,
 			Tracing:                 false,
@@ -279,6 +294,10 @@ func (opts *Options) AddFlags(fs *pflag.FlagSet) {
 		"the prefiller's OffloadingConnector P2P tier listening port, injected as remote_port on the decode request; with --data-parallel-size > 1 this is the rank-0 port and rank r uses port+r (used with --kv-connector=offloading or --enable-p2p-pull)")
 	fs.BoolVar(&opts.EnableP2PPull, enableP2PPull, opts.EnableP2PPull,
 		"declare the OffloadingConnector P2P tier available for cached-prefix pulls when the PD connector is NIXL, i.e. engines run MultiConnector(NixlConnector + OffloadingConnector). Rejected with any other --kv-connector; offloading provides the tier natively without this flag.")
+	fs.IntVar(&opts.KVCRControlPort, kvcrControlPortFlag, opts.KVCRControlPort,
+		"the peer's KVCR ZMQ control port, emitted as kv_hints source_control_endpoint tcp://<host>:<port>; with --data-parallel-size > 1 this is the rank-0 port and rank r uses port+r (used with --kv-connector=kvcr or --enable-kvcr-pull)")
+	fs.BoolVar(&opts.EnableKVCRPull, enableKVCRPull, opts.EnableKVCRPull,
+		"declare a KVCR secondary tier available for cached-prefix pulls when the PD connector is NIXL, i.e. engines run MultiConnector(NixlConnector + OffloadingConnector with a KVCR tier). Rejected with any other --kv-connector, and mutually exclusive with --enable-p2p-pull; kvcr provides the tier natively without this flag.")
 	fs.BoolVar(&opts.SecureServing, secureServing, opts.SecureServing, "Serve the listener over TLS.")
 	fs.BoolVar(&opts.SecureServing, secureProxy, opts.SecureServing, "Deprecated: use --secure-serving instead.")
 	_ = fs.MarkDeprecated(secureProxy, "use --secure-serving instead")
@@ -713,11 +732,31 @@ func (opts *Options) Validate() error {
 			opts.P2PConnectorPort, opts.DataParallelSize-1)
 	}
 
+	// Validate KVCR control port, which is offset by DP rank the same way.
+	if opts.KVCRControlPort < 1 || opts.KVCRControlPort > 65535 {
+		return fmt.Errorf("--kvcr-control-port must be between 1 and 65535, got %d", opts.KVCRControlPort)
+	}
+	if opts.DataParallelSize > 1 && opts.KVCRControlPort+opts.DataParallelSize-1 > 65535 {
+		return fmt.Errorf("--kvcr-control-port %d plus data-parallel rank %d exceeds 65535",
+			opts.KVCRControlPort, opts.DataParallelSize-1)
+	}
+
 	// --enable-p2p-pull composes the OffloadingConnector P2P tier alongside NIXL
 	// via MultiConnector; it is only meaningful with the NIXLv2 PD connector.
 	// offloading already provides the tier natively and needs no flag.
 	if opts.EnableP2PPull && opts.KVConnector != constants.KVConnectorNIXLV2 {
 		return fmt.Errorf("--enable-p2p-pull requires --kv-connector=%s (got %q)", constants.KVConnectorNIXLV2, opts.KVConnector)
+	}
+
+	// --enable-kvcr-pull is the KVCR sibling of --enable-p2p-pull, with the same
+	// NIXLv2-only restriction. The two are mutually exclusive: a pod runs one
+	// secondary tier, and the sidecar injects one request field, so declaring
+	// both would make the pull protocol ambiguous.
+	if opts.EnableKVCRPull && opts.KVConnector != constants.KVConnectorNIXLV2 {
+		return fmt.Errorf("--enable-kvcr-pull requires --kv-connector=%s (got %q)", constants.KVConnectorNIXLV2, opts.KVConnector)
+	}
+	if opts.EnableP2PPull && opts.EnableKVCRPull {
+		return errors.New("--enable-p2p-pull and --enable-kvcr-pull are mutually exclusive")
 	}
 
 	// Validate SSRF protection requirements
@@ -807,6 +846,9 @@ func (opts *Options) mergeYAMLConfiguration(cfg yamlConfiguration) {
 	if cfg.P2PConnectorPort != 0 && !opts.isFlagSet(p2pConnectorPortFlag) {
 		opts.P2PConnectorPort = cfg.P2PConnectorPort
 	}
+	if cfg.KVCRControlPort != 0 && !opts.isFlagSet(kvcrControlPortFlag) {
+		opts.KVCRControlPort = cfg.KVCRControlPort
+	}
 	if cfg.DataParallelSize != 0 && !opts.isFlagSet(dataParallelSize) {
 		opts.DataParallelSize = cfg.DataParallelSize
 	}
@@ -829,6 +871,9 @@ func (opts *Options) mergeYAMLConfiguration(cfg yamlConfiguration) {
 	}
 	if cfg.EnableP2PPull != nil && !opts.isFlagSet(enableP2PPull) {
 		opts.EnableP2PPull = *cfg.EnableP2PPull
+	}
+	if cfg.EnableKVCRPull != nil && !opts.isFlagSet(enableKVCRPull) {
+		opts.EnableKVCRPull = *cfg.EnableKVCRPull
 	}
 
 	if !opts.isSecureServingFlagSet() {

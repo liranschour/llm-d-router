@@ -48,6 +48,7 @@ const (
 	ContentTypeJSON = "application/json"
 
 	FieldKVTransferParams     = "kv_transfer_params"
+	FieldKVHints              = "kv_hints"
 	FieldECTransferParams     = "ec_transfer_params"
 	FieldMaxTokens            = "max_tokens"
 	FieldMaxCompletionTokens  = "max_completion_tokens"

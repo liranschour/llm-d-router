@@ -112,11 +112,12 @@ func (s *Server) handleP2P(w http.ResponseWriter, r *http.Request, prefillPodHos
 		v.Info("decode request body", logging.HTTPBodyKey, string(decodeBody))
 	}
 
-	s.handleP2PSequentialRequests(w, r, prefillBody, decodeBody, prefillPodHostPort)
+	s.handleSequentialPD(w, r, prefillBody, decodeBody, prefillPodHostPort, constants.KVConnectorOffloading)
 }
 
-// handleP2PSequentialRequests runs the prefill request to completion, then
-// dispatches decode.
+// handleSequentialPD runs the prefill request to completion, then dispatches
+// decode. Shared by the P2P-tier and KVCR connectors, which differ only in the
+// request field they inject; connector names the caller for telemetry.
 //
 // The decoder's fetch has to find the prefiller's blocks already stored. A
 // fetch that arrives first parks as unsatisfied demand on the prefiller's
@@ -125,7 +126,10 @@ func (s *Server) handleP2P(w http.ResponseWriter, r *http.Request, prefillPodHos
 // recomputes the prompt locally, which is the work disaggregation exists to
 // avoid. Sequencing the requests also matches the NIXL connector, which forwards to
 // the prefiller and waits for it to return before dispatching decode.
-func (s *Server) handleP2PSequentialRequests(w http.ResponseWriter, r *http.Request, prefillBody, decodeBody []byte, prefillHost string) {
+//
+// For KVCR the ordering is not merely preferable but required: its transfers
+// are destination-initiated, so there is no push-to-a-waiting-decoder mode.
+func (s *Server) handleSequentialPD(w http.ResponseWriter, r *http.Request, prefillBody, decodeBody []byte, prefillHost, connector string) {
 	tracer := tracing.Tracer(tracerScope)
 	ctx := r.Context()
 
@@ -143,7 +147,7 @@ func (s *Server) handleP2PSequentialRequests(w http.ResponseWriter, r *http.Requ
 	)
 	prefillSpan.SetAttributes(
 		semconv.LLMDPDProxyPrefillTarget(prefillHost),
-		semconv.LLMDPDProxyConnector(constants.KVConnectorOffloading),
+		semconv.LLMDPDProxyConnector(connector),
 		semconv.LLMDPDProxyPrefillAsync(false),
 	)
 	prefillStart := time.Now()
@@ -192,7 +196,7 @@ func (s *Server) handleP2PSequentialRequests(w http.ResponseWriter, r *http.Requ
 	)
 	defer decodeSpan.End()
 	decodeSpan.SetAttributes(
-		semconv.LLMDPDProxyConnector(constants.KVConnectorOffloading),
+		semconv.LLMDPDProxyConnector(connector),
 		semconv.LLMDPDProxyDecodeConcurrentWithPrefill(false),
 	)
 	decodeStart := time.Now()
@@ -291,44 +295,55 @@ func (s *Server) p2pSourceParams(sourceHostPort string) map[string]any {
 	}
 }
 
-// p2pPortFor resolves the P2P tier control port on the target endpoint. The
-// sidecar serves rank r on <base port>+r (data_parallel.go), so the routed
-// endpoint's port encodes the pod-local rank. vLLM binds the tier at the
-// engine's configured P2P base + the global data_parallel_index, so the
-// mapping is correct when each pod is its own DP group (local rank ==
-// global index). Multi-pod DP groups (e.g. LWS wide-EP) preserve it by
-// compensating the engine's per-pod base (P2P_BASE = <p2p-connector-port>
-// - START_RANK; see docs/disaggregation.md), so every pod binds local rank
-// r at <p2p-connector-port>+r and this pod-local derivation is the
-// contract there too. A port outside the rank range (or unparsable) falls
-// back to the base P2P port, which is rank 0's tier.
+// p2pPortFor resolves the P2P tier control port on the target endpoint: the
+// configured base offset by the target's pod-local DP rank (see rankFor for
+// how the rank is recovered and why the mapping holds).
 func (s *Server) p2pPortFor(targetHostPort string) int {
-	base := s.config.P2PConnectorPort
+	return s.config.P2PConnectorPort + s.rankFor(targetHostPort, "P2P")
+}
+
+// rankFor recovers the target endpoint's pod-local data-parallel rank from its
+// routed port. The sidecar serves rank r on <base port>+r (data_parallel.go),
+// so the routed endpoint's port encodes the rank.
+//
+// vLLM binds a tier at the engine's configured base + the global
+// data_parallel_index, so the mapping is correct when each pod is its own DP
+// group (local rank == global index). Multi-pod DP groups (e.g. LWS wide-EP)
+// preserve it by compensating the engine's per-pod base (P2P_BASE =
+// <p2p-connector-port> - START_RANK; see docs/disaggregation.md), so every pod
+// binds local rank r at <base>+r and this pod-local derivation is the contract
+// there too. KVCR indexes control_ports by dp_local_rank, which is the same
+// quantity, so both connectors share this helper.
+//
+// Returns 0 — rank 0, i.e. the caller's base port — whenever the rank cannot be
+// trusted: no data parallelism, an unparsable port, or a rank outside
+// [0, DataParallelSize). kind names the caller for the debug logs.
+func (s *Server) rankFor(targetHostPort, kind string) int {
 	if s.config.DataParallelSize <= 1 || s.dpBasePort == 0 {
-		return base
+		return 0
 	}
 	// Backward compatible behavior: trim `http:` prefix (see createProxyHandler).
 	targetHostPort, _ = strings.CutPrefix(targetHostPort, "http://")
 	_, portStr, err := net.SplitHostPort(targetHostPort)
 	if err != nil {
-		s.logger.V(logging.DEBUG).Info("P2P target has no parsable port, using base P2P port",
-			"target", targetHostPort, "error", err)
-		return base
+		s.logger.V(logging.DEBUG).Info("target has no parsable port, using rank 0 base port",
+			"kind", kind, "target", targetHostPort, "error", err)
+		return 0
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
-		s.logger.V(logging.DEBUG).Info("P2P target port is not numeric, using base P2P port",
-			"target", targetHostPort, "error", err)
-		return base
+		s.logger.V(logging.DEBUG).Info("target port is not numeric, using rank 0 base port",
+			"kind", kind, "target", targetHostPort, "error", err)
+		return 0
 	}
 	rank := port - s.dpBasePort
 	if rank < 0 || rank >= s.config.DataParallelSize {
-		s.logger.V(logging.DEBUG).Info("P2P target port outside the DP rank range, using base P2P port",
-			"target", targetHostPort, "dpBasePort", s.dpBasePort,
+		s.logger.V(logging.DEBUG).Info("target port outside the DP rank range, using rank 0 base port",
+			"kind", kind, "target", targetHostPort, "dpBasePort", s.dpBasePort,
 			"dataParallelSize", s.config.DataParallelSize)
-		return base
+		return 0
 	}
-	return base + rank
+	return rank
 }
 
 // decodeWithP2PSource serves a decoder-only request through the local vLLM

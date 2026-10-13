@@ -130,8 +130,8 @@ func (s *Server) disaggregatedPrefillHandler(apiType reqcommon.APIType) http.Han
 		kvCacheSource := strings.TrimSpace(routing.TakeRoutingHeaderValue(r.Header, routing.KVCacheSourceHeader))
 		if kvCacheSource != "" {
 			switch {
-			case !s.p2pPullAvailable():
-				logger.V(logging.DEBUG).Info("ignoring KV cache source header: connector does not support P2P pulls",
+			case !s.p2pPullAvailable() && !s.kvcrPullAvailable():
+				logger.V(logging.DEBUG).Info("ignoring KV cache source header: connector does not support cached-prefix pulls",
 					"connector", s.config.KVConnector)
 				kvCacheSource = ""
 			case !isHostPort(kvCacheSource):
@@ -219,7 +219,14 @@ func (s *Server) disaggregatedPrefillHandler(apiType reqcommon.APIType) http.Han
 		}
 		if !s.forwardDataParallel || !s.dataParallelHandler(w, r) {
 			if kvCacheSource != "" {
-				s.decodeWithP2PSource(w, r, kvCacheSource)
+				// The tier decides the request field: a kv_hints envelope for
+				// KVCR, kv_transfer_params for the P2P tier. The two are
+				// mutually exclusive by configuration, so at most one applies.
+				if s.kvcrPullAvailable() {
+					s.decodeWithKVCRSource(w, r, kvCacheSource)
+				} else {
+					s.decodeWithP2PSource(w, r, kvCacheSource)
+				}
 				return
 			}
 			if s.config.DecodeChunkSize > 0 && r.URL.Path == reqcommon.PathChatCompletions {

@@ -165,7 +165,7 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 	}
 
 	// Compose the OffloadingConnector p2p pull onto the NIXL prefill request.
-	s.addP2PPullToPrefill(prefillRequest[reqcommon.FieldKVTransferParams].(map[string]any), kvCacheSource, prefillPodHostPort)
+	s.addCachedPrefixPullToPrefill(prefillRequest, kvCacheSource, prefillPodHostPort)
 
 	reqcommon.CapSingleToken(prefillRequest, apiType)
 
@@ -531,7 +531,7 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 		}
 	}
 	// Compose the OffloadingConnector p2p pull onto the NIXL prefill request.
-	s.addP2PPullToPrefill(prefillRequest[reqcommon.FieldKVTransferParams].(map[string]any), kvCacheSource, prefillPodHostPort)
+	s.addCachedPrefixPullToPrefill(prefillRequest, kvCacheSource, prefillPodHostPort)
 
 	reqcommon.CapSingleToken(prefillRequest, apiType)
 
